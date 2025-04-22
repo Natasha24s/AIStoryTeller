@@ -1,0 +1,698 @@
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AI Storyboard Generator with API Gateway, Lambda, and S3'
+
+Resources:
+  # S3 Bucket for storing generated images
+  StoryImagesBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-story-images'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+      LifecycleConfiguration:
+        Rules:
+          - Id: DeleteOldFiles
+            Status: Enabled
+            ExpirationInDays: 7
+
+  # S3 Bucket for video output
+  VideoOutputBucket:
+    Type: 'AWS::S3::Bucket'
+    Properties:
+      BucketName: !Sub '${AWS::StackName}-video-output'
+      CorsConfiguration:
+        CorsRules:
+          - AllowedHeaders: ['*']
+            AllowedMethods: [GET]
+            AllowedOrigins: ['*']
+            MaxAge: 3000
+
+  # Main Story Generator Lambda
+  StoryGeneratorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-generator'
+      Handler: index.handler
+      Role: !GetAtt LambdaExecutionRole.Arn
+      Environment:
+        Variables:
+          BUCKET_NAME: !Ref StoryImagesBucket
+      Code:
+        ZipFile: |
+          import json
+          import boto3
+          import base64
+          import time
+          from botocore.config import Config
+          from datetime import datetime
+          import uuid
+          import re
+          import os
+
+          # Get bucket name from environment variable
+          BUCKET_NAME = os.environ['BUCKET_NAME']
+
+          # Define the target resolution
+          TARGET_WIDTH = 1280
+          TARGET_HEIGHT = 720
+
+          # Create the clients
+          bedrock = boto3.client(
+              service_name='bedrock-runtime',
+              region_name="us-east-1",
+              config=Config(read_timeout=300)
+          )
+          s3 = boto3.client('s3')
+
+          def sanitize_topic(topic):
+              """
+              Sanitizes the topic string for use in file names
+              """
+              sanitized = topic.lower().replace(' ', '_')
+              sanitized = re.sub(r'[^a-z0-9_]', '', sanitized)
+              return sanitized[:30]
+
+          def generate_story_id(topic):
+              """
+              Generates a unique story ID using date, topic, and UUID
+              """
+              date_str = datetime.now().strftime('%Y%m%d')
+              topic_str = sanitize_topic(topic)
+              unique_id = str(uuid.uuid4())[:6]
+              return f"{date_str}_{topic_str}_{unique_id}"
+
+          def generate_story_steps(user_input):
+              """
+              Generates story scenes using Nova-Lite model
+              """
+              try:
+                  conversation = [
+                      {
+                          "role": "user",
+                          "content": [{"text": f"Create 5 visual scene descriptions for a story about: {user_input}"}],
+                      }
+                  ]
+
+                  response = bedrock.converse(
+                      modelId="amazon.nova-lite-v1:0",
+                      messages=conversation,
+                      inferenceConfig={
+                          "maxTokens": 1000,
+                          "temperature": 0.7,
+                          "topP": 0.9,
+                      }
+                  )
+
+                  # Get the generated text from Nova-Lite
+                  story_text = response["output"]["message"]["content"][0]["text"]
+                  
+                  # Clean up the text by removing scene numbers and titles
+                  scenes = []
+                  for line in story_text.split('\n'):
+                      line = line.strip()
+                      # Skip empty lines and lines that are scene titles
+                      if not line or line.startswith('###') or line.startswith('Scene'):
+                          continue
+                      scenes.append(line)
+                  
+                  # Ensure we have exactly 5 scenes
+                  scenes = scenes[:5]
+                  while len(scenes) < 5:
+                      scenes.append(f"Scene {len(scenes) + 1} about {user_input}")
+                      
+                  return {
+                      'scenes': scenes,
+                      'full_text': story_text
+                  }
+                  
+              except Exception as e:
+                  print(f"Error in generate_story_steps: {str(e)}")
+                  default_scenes = [f"Scene {i} about {user_input}" for i in range(1, 6)]
+                  return {
+                      'scenes': default_scenes,
+                      'full_text': '\n'.join(default_scenes)
+                  }
+
+          def image_from_text(text):
+              """
+              Generates an image from text using Nova-Canvas model
+              """
+              body = json.dumps({
+                  "taskType": "TEXT_IMAGE",
+                  "textToImageParams": {
+                      "text": text
+                  },
+                  "imageGenerationConfig": {
+                      "numberOfImages": 1,
+                      "width": TARGET_WIDTH,
+                      "height": TARGET_HEIGHT,
+                      "cfgScale": 8.0,
+                      "seed": 0
+                  }
+              })
+              
+              response = bedrock.invoke_model(
+                  body=body,
+                  modelId="amazon.nova-canvas-v1:0",
+                  accept="application/json",
+                  contentType="application/json"
+              )
+              
+              response_body = json.loads(response.get("body").read())
+              return response_body.get("images")[0]
+
+          def save_image_to_s3(image_base64, story_id, scene_number):
+              """
+              Saves a base64 encoded image to S3 and returns the URL
+              """
+              try:
+                  image_data = base64.b64decode(image_base64)
+                  key = f"{story_id}/scene_{scene_number}.png"
+                  
+                  s3.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=key,
+                      Body=image_data,
+                      ContentType='image/png'
+                  )
+                  
+                  url = f"https://{BUCKET_NAME}.s3.amazonaws.com/{key}"
+                  return url
+              except Exception as e:
+                  print(f"Error saving image to S3: {str(e)}")
+                  return None
+
+          def save_metadata_to_s3(story_id, metadata, scenes):
+              """
+              Saves metadata and scene information to S3
+              """
+              try:
+                  # Save the original metadata
+                  metadata['image_resolution'] = {
+                      'width': TARGET_WIDTH,
+                      'height': TARGET_HEIGHT
+                  }
+                  
+                  s3.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=f"{story_id}/metadata.json",
+                      Body=json.dumps(metadata),
+                      ContentType='application/json'
+                  )
+
+                  # Create scenes data in the requested format
+                  scenes_data = {
+                      f"shot{i+1}_text": scene
+                      for i, scene in enumerate(scenes)
+                  }
+
+                  # Save the scenes JSON
+                  s3.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=f"{story_id}/scenes.json",
+                      Body=json.dumps(scenes_data, indent=2),
+                      ContentType='application/json'
+                  )
+                  
+                  return True
+              except Exception as e:
+                  print(f"Error saving metadata to S3: {str(e)}")
+                  return False
+
+          def handler(event, context):
+              """
+              Lambda handler function
+              """
+              try:
+                  # Parse the incoming event
+                  if isinstance(event, dict):
+                      if 'body' in event:
+                          body = json.loads(event['body']) if isinstance(event['body'], str) else event['body']
+                      else:
+                          body = event
+                  else:
+                      body = json.loads(event)
+
+                  # Validate input
+                  user_input = body.get('topic')
+                  if not user_input:
+                      raise ValueError("Topic is required")
+                  
+                  # Generate story ID and scenes
+                  story_id = generate_story_id(user_input)
+                  print(f"Generating story for topic: {user_input}")
+                  
+                  # Get scenes and full text from Nova-Lite
+                  story_data = generate_story_steps(user_input)
+                  scenes = story_data['scenes']
+                  full_text = story_data['full_text']
+                  
+                  print("Generating images for scenes")
+                  images = []
+                  image_urls = []
+                  
+                  metadata = {
+                      'story_id': story_id,
+                      'story_topic': user_input,
+                      'creation_date': datetime.now().isoformat(),
+                      'scene_count': len(scenes),
+                      'scenes': scenes,
+                      'full_text': full_text,  # Store the full text in metadata
+                      'image_format': 'png'
+                  }
+                  
+                  # Save metadata and scenes
+                  save_metadata_to_s3(story_id, metadata, scenes)
+                  
+                  # Generate and save images
+                  for idx, scene in enumerate(scenes):
+                      print(f"Generating image {idx + 1}/5")
+                      if idx > 0:
+                          time.sleep(2)  # Rate limiting
+                      
+                      image_base64 = image_from_text(scene)
+                      image_url = save_image_to_s3(
+                          image_base64,
+                          story_id,
+                          idx + 1
+                      )
+                      
+                      images.append(image_base64)
+                      image_urls.append(image_url)
+                  
+                  response_data = {
+                      'story_id': story_id,
+                      'topic': user_input,
+                      'scenes': scenes,
+                      'full_text': full_text,
+                      'images': images,
+                      'image_urls': image_urls,
+                      'metadata': metadata
+                  }
+
+                  return {
+                      'statusCode': 200,
+                      'body': json.dumps(response_data),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+
+              except Exception as e:
+                  print(f"Error: {str(e)}")
+                  return {
+                      'statusCode': 500,
+                      'body': json.dumps({
+                          'error': str(e)
+                      }),
+                      'headers': {
+                          'Content-Type': 'application/json',
+                          'Access-Control-Allow-Origin': '*'
+                      }
+                  }
+      Runtime: python3.9
+      Timeout: 300
+      MemorySize: 2048
+
+  # Video Generator Lambda
+  VideoGeneratorFunction:
+    Type: 'AWS::Lambda::Function'
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-video-generator'
+      Handler: index.lambda_handler
+      Role: !GetAtt VideoGeneratorRole.Arn
+      Environment:
+        Variables:
+          SOURCE_BUCKET: !Ref StoryImagesBucket
+          DESTINATION_BUCKET: !Ref VideoOutputBucket
+      Code:
+        ZipFile: |
+          import json
+          import os
+          import boto3
+          import logging
+          from typing import Dict, Any
+
+          # Configure logging
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Environment variables
+          SOURCE_BUCKET = os.environ.get('SOURCE_BUCKET', 'story-story-images')
+          DESTINATION_BUCKET = os.environ.get('DESTINATION_BUCKET', 'story-video-output')
+
+          def load_scenes_from_s3(bucket: str, story_id: str) -> dict:
+              """Load scenes.json file from S3."""
+              try:
+                  s3_client = boto3.client('s3')
+                  file_path = f"{story_id}/scenes.json"
+                  logger.info(f"Attempting to load scenes.json from {bucket}/{file_path}")
+                  
+                  response = s3_client.get_object(
+                      Bucket=bucket,
+                      Key=file_path
+                  )
+                  scenes = json.loads(response['Body'].read().decode('utf-8'))
+                  logger.info(f"Successfully loaded scenes: {json.dumps(scenes, indent=2)}")
+                  return scenes
+              except Exception as e:
+                  logger.error(f"Error loading scenes.json from {file_path}: {str(e)}")
+                  raise
+
+          def clean_scene_text(text: str) -> str:
+              """Clean and format scene text."""
+              try:
+                  if not text:
+                      return ""
+                  
+                  # Log original text
+                  logger.debug(f"Original text: {text[:100]}...")
+                  
+                  # Convert to string if needed
+                  text = str(text).strip()
+                  
+                  # Remove markdown formatting
+                  text = text.replace('**', '')
+                  
+                  # Remove numbering if present
+                  if text[0].isdigit():
+                      parts = text.split('.', 1)
+                      if len(parts) > 1:
+                          text = parts[1]
+                  
+                  # Remove any leading/trailing whitespace
+                  text = text.strip()
+                  
+                  # Log cleaned text
+                  logger.debug(f"Cleaned text: {text[:100]}...")
+                  
+                  return text
+              except Exception as e:
+                  logger.warning(f"Error in clean_scene_text: {str(e)}")
+                  return text
+
+          def check_image_exists(bucket: str, story_id: str, scene_num: int) -> bool:
+              """Check if scene image exists in S3."""
+              try:
+                  s3_client = boto3.client('s3')
+                  image_path = f"{story_id}/scene_{scene_num}.png"
+                  s3_client.head_object(Bucket=bucket, Key=image_path)
+                  logger.info(f"Image found: {image_path}")
+                  return True
+              except Exception as e:
+                  logger.info(f"Image not found: {image_path}")
+                  return False
+
+          def get_model_input(event: dict) -> dict:
+              """Create model input configuration."""
+              try:
+                  story_id = event.get('story_id')
+                  if not story_id:
+                      raise ValueError("story_id is required in the event")
+                  
+                  logger.info(f"Processing story_id: {story_id}")
+                  
+                  # Load scenes
+                  scenes = load_scenes_from_s3(SOURCE_BUCKET, story_id)
+                  
+                  # Create shots array
+                  shots = []
+                  shot_keys = sorted([k for k in scenes.keys() if k.startswith('shot') and k.endswith('_text')])
+                  
+                  logger.info(f"Found {len(shot_keys)} shots to process")
+                  
+                  for shot_key in shot_keys:
+                      if scenes[shot_key]:
+                          shot_num = int(shot_key.replace('shot', '').replace('_text', ''))
+                          
+                          # Create shot with cleaned text
+                          cleaned_text = clean_scene_text(scenes[shot_key])
+                          shot = {
+                              "text": cleaned_text
+                          }
+                          
+                          # Add image if exists
+                          if check_image_exists(SOURCE_BUCKET, story_id, shot_num):
+                              shot["image"] = {
+                                  "format": "png",
+                                  "source": {
+                                      "s3Location": {
+                                          "uri": f"s3://{SOURCE_BUCKET}/{story_id}/scene_{shot_num}.png"
+                                      }
+                                  }
+                              }
+                          
+                          shots.append(shot)
+                          logger.info(f"Processed {shot_key} successfully")
+                  
+                  if not shots:
+                      raise ValueError("No valid shots found in scenes.json")
+                  
+                  model_input = {
+                      "taskType": "MULTI_SHOT_MANUAL",
+                      "multiShotManualParams": {
+                          "shots": shots
+                      },
+                      "videoGenerationConfig": {
+                          "seed": event.get('seed', 1234),
+                          "fps": 24,
+                          "dimension": "1280x720"
+                      }
+                  }
+                  
+                  logger.info(f"Created model input: {json.dumps(model_input, indent=2)}")
+                  return model_input
+                  
+              except Exception as e:
+                  logger.error(f"Error in get_model_input: {str(e)}")
+                  raise
+
+          def lambda_handler(event: dict, context: Any) -> Dict[str, Any]:
+              """Lambda function handler."""
+              try:
+                  logger.info(f"Received event: {json.dumps(event)}")
+                  
+                  if not SOURCE_BUCKET or not DESTINATION_BUCKET:
+                      raise ValueError("SOURCE_BUCKET and DESTINATION_BUCKET environment variables must be set")
+
+                  bedrock_client = boto3.client(
+                      service_name="bedrock-runtime",
+                      region_name=os.environ.get('AWS_REGION', 'us-east-1')
+                  )
+                  
+                  model_input = get_model_input(event)
+                  
+                  invocation = bedrock_client.start_async_invoke(
+                      modelId="amazon.nova-reel-v1:1",
+                      modelInput=model_input,
+                      outputDataConfig={
+                          "s3OutputDataConfig": {
+                              "s3Uri": f"s3://{DESTINATION_BUCKET}"
+                          }
+                      }
+                  )
+                  
+                  response = {
+                      'statusCode': 200,
+                      'body': {
+                          'message': 'Video generation started successfully',
+                          'source_bucket': SOURCE_BUCKET,
+                          'destination_bucket': DESTINATION_BUCKET,
+                          'invocation_details': invocation
+                      }
+                  }
+                  
+                  logger.info(f"Success response: {json.dumps(response, default=str)}")
+                  return response
+
+              except Exception as err:
+                  logger.error(f"Error in lambda_handler: {str(err)}", exc_info=True)
+                  return {
+                      'statusCode': 500,
+                      'body': {
+                          'error': str(err)
+                      }
+                  }
+      Runtime: python3.9
+      Timeout: 900
+      MemorySize: 1024
+
+  # API Gateway
+  StoryGeneratorApi:
+    Type: 'AWS::ApiGateway::RestApi'
+    Properties:
+      Name: !Sub '${AWS::StackName}-api'
+      Description: API for Story Generator
+
+  # Story Generator API Resources
+  StoryGeneratorResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+      ParentId: !GetAtt StoryGeneratorApi.RootResourceId
+      PathPart: generate
+
+  StoryGeneratorMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+      ResourceId: !Ref StoryGeneratorResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${StoryGeneratorFunction.Arn}/invocations'
+
+  # Video Generator API Resources
+  VideoGeneratorResource:
+    Type: 'AWS::ApiGateway::Resource'
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+      ParentId: !GetAtt StoryGeneratorApi.RootResourceId
+      PathPart: generate-video
+
+  VideoGeneratorMethod:
+    Type: 'AWS::ApiGateway::Method'
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+      ResourceId: !Ref VideoGeneratorResource
+      HttpMethod: POST
+      AuthorizationType: NONE
+      Integration:
+        Type: AWS_PROXY
+        IntegrationHttpMethod: POST
+        Uri: !Sub 'arn:aws:apigateway:${AWS::Region}:lambda:path/2015-03-31/functions/${VideoGeneratorFunction.Arn}/invocations'
+
+  StoryGeneratorDeployment:
+    Type: 'AWS::ApiGateway::Deployment'
+    DependsOn: 
+      - StoryGeneratorMethod
+      - VideoGeneratorMethod
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+
+  StoryGeneratorStage:
+    Type: 'AWS::ApiGateway::Stage'
+    Properties:
+      RestApiId: !Ref StoryGeneratorApi
+      DeploymentId: !Ref StoryGeneratorDeployment
+      StageName: prod
+
+  # IAM Roles
+  LambdaExecutionRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:Converse'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:PutObject'
+                  - 's3:GetObject'
+                Resource: !Sub '${StoryImagesBucket.Arn}/*'
+
+  # Video Generator Role with updated permissions
+  VideoGeneratorRole:
+    Type: 'AWS::IAM::Role'
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: 'sts:AssumeRole'
+      ManagedPolicyArns:
+        - 'arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole'
+      Policies:
+        - PolicyName: BedrockAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 'bedrock:InvokeModel'
+                  - 'bedrock:StartAsyncInvoke'
+                  - 'bedrock:GetAsyncInvoke'
+                Resource: '*'
+        - PolicyName: S3Access
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - 's3:GetObject'
+                  - 's3:PutObject'
+                  - 's3:HeadObject'
+                Resource:
+                  - !Sub '${StoryImagesBucket.Arn}/*'
+                  - !Sub '${VideoOutputBucket.Arn}/*'
+
+  # Lambda Permissions
+  StoryGeneratorPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt StoryGeneratorFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StoryGeneratorApi}/*/*/*'
+
+  VideoGeneratorPermission:
+    Type: 'AWS::Lambda::Permission'
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !GetAtt VideoGeneratorFunction.Arn
+      Principal: apigateway.amazonaws.com
+      SourceArn: !Sub 'arn:aws:execute-api:${AWS::Region}:${AWS::AccountId}:${StoryGeneratorApi}/*/*/*'
+
+Outputs:
+  StoryApiEndpoint:
+    Description: 'Story Generator API Endpoint'
+    Value: !Sub 'https://${StoryGeneratorApi}.execute-api.${AWS::Region}.amazonaws.com/prod/generate'
+
+  VideoApiEndpoint:
+    Description: 'Video Generator API Endpoint'
+    Value: !Sub 'https://${StoryGeneratorApi}.execute-api.${AWS::Region}.amazonaws.com/prod/generate-video'
+
+  StoryImagesBucketName:
+    Description: 'S3 Bucket for story images'
+    Value: !Ref StoryImagesBucket
+
+  VideoOutputBucketName:
+    Description: 'S3 Bucket for video output'
+    Value: !Ref VideoOutputBucket
+
+  StoryImagesBucketURL:
+    Description: 'S3 Bucket URL for story images'
+    Value: !Sub 'https://${StoryImagesBucket}.s3.amazonaws.com/'
+
+  VideoOutputBucketURL:
+    Description: 'S3 Bucket URL for video output'
+    Value: !Sub 'https://${VideoOutputBucket}.s3.amazonaws.com/'
