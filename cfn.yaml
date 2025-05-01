@@ -530,7 +530,7 @@ Resources:
               output_location = f"{s3_location}/output.mp4" if status == "Completed" else None
               return status, output_location
 
-          def lambda_handler(event: dict, context: Any) -> Dict[str, Any]:
+          def handler(event: dict, context: Any) -> Dict[str, Any]:
               try:
                   logger.info(f"Received event: {json.dumps(event)}")
                   story_id = event.get('story_id')
