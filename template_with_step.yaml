@@ -1,3 +1,4 @@
+
 AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Template for API Gateway triggering Step Function with two Lambda steps'
 
@@ -376,7 +377,7 @@ Resources:
 
           SOURCE_BUCKET = os.environ.get('SOURCE_BUCKET', 'story-story-images')
           DESTINATION_BUCKET = os.environ.get('DESTINATION_BUCKET', 'story-video-output')
-          AWS_REGION = os.environ.get('AWS_REGION', 'us-east-1')
+          AWS_REGION = boto3.session.Session().region_name
           MODEL_ID = "amazon.nova-reel-v1:1"
           SLEEP_SECONDS = 15
           MAX_MONITORING_TIME = 900
