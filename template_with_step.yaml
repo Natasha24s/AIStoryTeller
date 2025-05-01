@@ -356,7 +356,7 @@ Resources:
       Environment:
         Variables:
           BUCKET_NAME: !Ref SourceBucketName
-  SecondLambda:
+    SecondLambda:
     Type: AWS::Lambda::Function
     Properties:
       FunctionName: VideoGeneratorFunction
@@ -377,7 +377,6 @@ Resources:
 
           SOURCE_BUCKET = os.environ.get('SOURCE_BUCKET', 'story-story-images')
           DESTINATION_BUCKET = os.environ.get('DESTINATION_BUCKET', 'story-video-output')
-          AWS_REGION = boto3.session.Session().region_name
           MODEL_ID = "amazon.nova-reel-v1:1"
           SLEEP_SECONDS = 15
           MAX_MONITORING_TIME = 900
@@ -501,10 +500,8 @@ Resources:
                   if not story_id:
                       raise ValueError("story_id is required in the event")
 
-                  bedrock_client = boto3.client(
-                      service_name="bedrock-runtime",
-                      region_name=AWS_REGION
-                  )
+                  # Create bedrock client without specifying region
+                  bedrock_client = boto3.client('bedrock-runtime')
                   
                   model_input = get_model_input(story_id)
                   
@@ -565,7 +562,6 @@ Resources:
         Variables:
           SOURCE_BUCKET: !Ref SourceBucketName
           DESTINATION_BUCKET: !Ref DestinationBucketName
-          AWS_REGION: !Ref 'AWS::Region'
 
   # Step Function
   StatesExecutionRole:
