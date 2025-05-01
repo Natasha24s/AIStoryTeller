@@ -646,11 +646,10 @@ Resources:
               "Type": "Task",
               "Resource": "${SecondLambda.Arn}",
               "InputPath": "$.storyResult",
-              "ResultPath": "$.videoResult",
+              "OutputPath": "$.body",
               "End": true
             }
-          },
-          "OutputPath": "$.videoResult.body"
+          }
         }
 
   # API Gateway
