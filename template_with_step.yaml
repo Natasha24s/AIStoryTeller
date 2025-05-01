@@ -1,4 +1,4 @@
-AWSTemplateFormatVersion: '2010-09-01'
+AWSTemplateFormatVersion: '2010-09-09'
 Description: 'Template for API Gateway triggering Step Function with two Lambda steps'
 
 Parameters:
