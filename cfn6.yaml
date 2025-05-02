@@ -224,7 +224,7 @@ Resources:
                   "taskType": "TEXT_IMAGE",
                   "textToImageParams": {
                       "text": text,
-                      "negativeText": "blurry, distorted, melting, overlapping elements, cartoon images, inconsistent appearances, changing features, morphing characters"
+                      "negativeText": "blurry, distorted, melting, overlapping elements, cartoon, anime, illustration, drawing, painted, artistic, sketchy, comic book style, cel shading, unrealistic, low quality, artificial, inconsistent appearances, changing features, morphing characters, animation style"
                   },
                   "imageGenerationConfig": {
                       "numberOfImages": 1,
