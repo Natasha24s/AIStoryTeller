@@ -673,11 +673,8 @@ Resources:
             "GenerateStory": {
               "Type": "Task",
               "Resource": "${FirstLambda.Arn}",
-              "ResultSelector": {
-                "parsed_story_id.$": "States.StringToJson($.body).story_id"
-              },
-              "ResultPath": "$.storyResult",
               "Next": "GenerateVideo",
+              "ResultPath": "$.result",
               "Catch": [
                 {
                   "ErrorEquals": ["States.ALL"],
@@ -689,7 +686,7 @@ Resources:
               "Type": "Task",
               "Resource": "${SecondLambda.Arn}",
               "Parameters": {
-                "story_id.$": "$.storyResult.parsed_story_id"
+                "story_id.$": "States.StringToJson($.result.body).story_id"
               },
               "ResultPath": "$.videoResult",
               "OutputPath": "$.videoResult.body",
