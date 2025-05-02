@@ -673,7 +673,11 @@ Resources:
             "GenerateStory": {
               "Type": "Task",
               "Resource": "${FirstLambda.Arn}",
-              "Next": "ParseStoryId",
+              "Next": "GenerateVideo",
+              "ResultPath": "$.storyResult",
+              "Parameters": {
+                "story_id.$": "States.StringToJson($.body).story_id"
+              },
               "Catch": [
                 {
                   "ErrorEquals": ["States.ALL"],
@@ -681,16 +685,10 @@ Resources:
                 }
               ]
             },
-            "ParseStoryId": {
-              "Type": "Pass",
-              "InputPath": "$.body",
-              "ResultPath": "$.parsed",
-              "Next": "GenerateVideo"
-            },
             "GenerateVideo": {
               "Type": "Task",
               "Resource": "${SecondLambda.Arn}",
-              "InputPath": "$.parsed.story_id",
+              "InputPath": "$.storyResult.story_id",
               "OutputPath": "$.body",
               "End": true,
               "Catch": [
@@ -707,6 +705,7 @@ Resources:
             }
           }
         }
+
 
 
   # API Gateway Role with updated permissions
