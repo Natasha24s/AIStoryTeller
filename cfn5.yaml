@@ -673,11 +673,11 @@ Resources:
             "GenerateStory": {
               "Type": "Task",
               "Resource": "${FirstLambda.Arn}",
-              "Next": "GenerateVideo",
-              "ResultPath": "$.storyResult",
-              "Parameters": {
-                "story_id.$": "States.StringToJson($.body).story_id"
+              "ResultSelector": {
+                "parsed_story_id.$": "States.StringToJson($.body).story_id"
               },
+              "ResultPath": "$.storyResult",
+              "Next": "GenerateVideo",
               "Catch": [
                 {
                   "ErrorEquals": ["States.ALL"],
@@ -688,8 +688,11 @@ Resources:
             "GenerateVideo": {
               "Type": "Task",
               "Resource": "${SecondLambda.Arn}",
-              "InputPath": "$.storyResult.story_id",
-              "OutputPath": "$.body",
+              "Parameters": {
+                "story_id.$": "$.storyResult.parsed_story_id"
+              },
+              "ResultPath": "$.videoResult",
+              "OutputPath": "$.videoResult.body",
               "End": true,
               "Catch": [
                 {
@@ -705,8 +708,6 @@ Resources:
             }
           }
         }
-
-
 
   # API Gateway Role with updated permissions
   ApiGatewayRole:
