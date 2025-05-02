@@ -674,6 +674,7 @@ Resources:
               "Type": "Task",
               "Resource": "${FirstLambda.Arn}",
               "Next": "ParseResponse",
+              "ResultPath": "$.storyResult",
               "Catch": [
                 {
                   "ErrorEquals": ["States.ALL"],
@@ -684,14 +685,19 @@ Resources:
             "ParseResponse": {
               "Type": "Pass",
               "Parameters": {
-                "story_id.$": "States.StringToJson($.body).story_id"
+                "parsed_body.$": "$.storyResult.body",
+                "story_id.$": "States.StringToJson($.storyResult.body).story_id"
               },
               "Next": "GenerateVideo"
             },
             "GenerateVideo": {
               "Type": "Task",
               "Resource": "${SecondLambda.Arn}",
-              "OutputPath": "$.body",
+              "Parameters": {
+                "story_id.$": "$.story_id"
+              },
+              "ResultPath": "$.videoResult",
+              "OutputPath": "$.videoResult.body",
               "End": true,
               "Catch": [
                 {
@@ -707,6 +713,7 @@ Resources:
             }
           }
         }
+
   # API Gateway Role with updated permissions
   ApiGatewayRole:
     Type: AWS::IAM::Role
