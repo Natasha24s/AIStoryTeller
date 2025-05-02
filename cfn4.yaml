@@ -83,9 +83,9 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:StartAsyncInvoke
                   - bedrock:GetAsyncInvoke
-                Resource: '*'
+                Resource: '*'       
 
-  ApiGatewayRole:
+    ApiGatewayRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -103,8 +103,14 @@ Resources:
               - Effect: Allow
                 Action:
                   - states:StartExecution
+                Resource: 
+                  - !GetAtt StoryProcessingStateMachine.Arn
+              - Effect: Allow
+                Action:
                   - states:DescribeExecution
-                Resource: !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:*
+                Resource: 
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}/*
+
   # First Lambda Function
   FirstLambda:
     Type: AWS::Lambda::Function
