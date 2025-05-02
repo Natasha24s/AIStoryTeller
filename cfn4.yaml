@@ -85,7 +85,7 @@ Resources:
                   - bedrock:GetAsyncInvoke
                 Resource: '*'
 
-  ApiGatewayRole:
+  StatesExecutionRole:
     Type: AWS::IAM::Role
     Properties:
       AssumeRolePolicyDocument:
@@ -93,26 +93,26 @@ Resources:
         Statement:
           - Effect: Allow
             Principal:
-              Service: apigateway.amazonaws.com
+              Service: states.amazonaws.com
             Action: sts:AssumeRole
       Policies:
-        - PolicyName: StepFunctionsExecution
+        - PolicyName: LambdaInvoke
           PolicyDocument:
             Version: '2012-10-17'
             Statement:
               - Effect: Allow
                 Action:
-                  - states:StartExecution
-                Resource: 
-                  - !GetAtt StoryProcessingStateMachine.Arn
-              - Effect: Allow
-                Action:
-                  - states:DescribeExecution
-                Resource: 
-                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}/*
+                  - lambda:InvokeFunction
+                Resource:
+                  - !GetAtt FirstLambda.Arn
+                  - !GetAtt SecondLambda.Arn
+
   # First Lambda Function
   FirstLambda:
     Type: AWS::Lambda::Function
+    DependsOn:
+      - FirstLambdaRole
+      - SourceBucket
     Properties:
       FunctionName: StoryGeneratorFunction
       Handler: index.handler
@@ -129,14 +129,10 @@ Resources:
           import re
           import os
 
-          # Get bucket name from environment variable
           BUCKET_NAME = os.environ['BUCKET_NAME']
-
-          # Define the target resolution
           TARGET_WIDTH = 1280
           TARGET_HEIGHT = 720
 
-          # Create the clients
           bedrock = boto3.client(
               service_name='bedrock-runtime',
               region_name="us-east-1",
@@ -145,26 +141,17 @@ Resources:
           s3 = boto3.client('s3')
 
           def sanitize_topic(topic):
-              """
-              Sanitizes the topic string for use in file names
-              """
               sanitized = topic.lower().replace(' ', '_')
               sanitized = re.sub(r'[^a-z0-9_]', '', sanitized)
               return sanitized[:30]
 
           def generate_story_id(topic):
-              """
-              Generates a unique story ID using date, topic, and UUID
-              """
               date_str = datetime.now().strftime('%Y%m%d')
               topic_str = sanitize_topic(topic)
               unique_id = str(uuid.uuid4())[:6]
               return f"{date_str}_{topic_str}_{unique_id}"
 
           def generate_story_steps(user_input):
-              """
-              Generates story scenes using Claude 3 Sonnet through Amazon Bedrock
-              """
               try:
                   enhanced_prompt = f"""Create 5 sequential scenes telling a story about: {user_input}
 
@@ -243,11 +230,8 @@ Resources:
                       'scenes': default_scenes,
                       'full_text': '\n'.join(default_scenes)
                   }
-              
+
           def image_from_text(text):
-              """
-              Generates an image from text using Nova-Canvas model with improved parameters
-              """
               body = json.dumps({
                   "taskType": "TEXT_IMAGE",
                   "textToImageParams": {
@@ -274,9 +258,6 @@ Resources:
               return response_body.get("images")[0]
 
           def save_image_to_s3(image_base64, story_id, scene_number):
-              """
-              Saves a base64 encoded image to S3 and returns the URL
-              """
               try:
                   image_data = base64.b64decode(image_base64)
                   key = f"{story_id}/scene_{scene_number}.png"
@@ -295,9 +276,6 @@ Resources:
                   return None
 
           def save_metadata_to_s3(story_id, metadata, scenes):
-              """
-              Saves metadata and scene information to S3
-              """
               try:
                   metadata['image_resolution'] = {
                       'width': TARGET_WIDTH,
@@ -329,9 +307,6 @@ Resources:
                   return False
 
           def extract_character_details(story_text):
-              """
-              Extracts and tracks character details from the story
-              """
               characters = {}
               name_pattern = r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)'
               
@@ -355,9 +330,6 @@ Resources:
               return scene_text
 
           def handler(event, context):
-              """
-              Lambda handler function
-              """
               try:
                   if isinstance(event, dict):
                       if 'body' in event:
@@ -378,7 +350,6 @@ Resources:
                   scenes = story_data['scenes']
                   full_text = story_data['full_text']
                   
-                  # Extract character details
                   characters = extract_character_details(full_text)
                   
                   print("Generating images for scenes")
@@ -465,6 +436,10 @@ Resources:
   # Second Lambda Function
   SecondLambda:
     Type: AWS::Lambda::Function
+    DependsOn:
+      - SecondLambdaRole
+      - SourceBucket
+      - DestinationBucket
     Properties:
       FunctionName: VideoGeneratorFunction
       Handler: index.handler
@@ -668,33 +643,13 @@ Resources:
         Variables:
           SOURCE_BUCKET: !Ref SourceBucketName
           DESTINATION_BUCKET: !Ref DestinationBucketName
-
-  # Step Function
-  StatesExecutionRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: states.amazonaws.com
-            Action: sts:AssumeRole
-      Policies:
-        - PolicyName: LambdaInvoke
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - lambda:InvokeFunction
-                Resource:
-                  - !GetAtt FirstLambda.Arn
-                  - !GetAtt SecondLambda.Arn
-
+  # Step Function (defined before API Gateway)
   StoryProcessingStateMachine:
     Type: AWS::StepFunctions::StateMachine
-    DependsOn: ApiGatewayRole
+    DependsOn:
+      - FirstLambda
+      - SecondLambda
+      - StatesExecutionRole
     Properties:
       RoleArn: !GetAtt StatesExecutionRole.Arn
       DefinitionString: !Sub |
@@ -738,14 +693,44 @@ Resources:
           }
         }
 
-  # API Gateway
+  # API Gateway Role (after Step Function)
+  ApiGatewayRole:
+    Type: AWS::IAM::Role
+    DependsOn: StoryProcessingStateMachine
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: apigateway.amazonaws.com
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: StepFunctionsExecution
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - states:StartExecution
+                Resource: 
+                  - !Ref StoryProcessingStateMachine
+              - Effect: Allow
+                Action:
+                  - states:DescribeExecution
+                Resource: 
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}/*
+
+  # API Gateway Resources
   Api:
     Type: AWS::ApiGateway::RestApi
+    DependsOn: ApiGatewayRole
     Properties:
       Name: StoryGeneratorAPI
 
   ApiResource:
     Type: AWS::ApiGateway::Resource
+    DependsOn: Api
     Properties:
       RestApiId: !Ref Api
       ParentId: !GetAtt Api.RootResourceId
@@ -753,6 +738,7 @@ Resources:
 
   StatusResource:
     Type: AWS::ApiGateway::Resource
+    DependsOn: Api
     Properties:
       RestApiId: !Ref Api
       ParentId: !GetAtt Api.RootResourceId
@@ -760,6 +746,10 @@ Resources:
 
   ApiMethod:
     Type: AWS::ApiGateway::Method
+    DependsOn: 
+      - ApiGatewayRole
+      - ApiResource
+      - StoryProcessingStateMachine
     Properties:
       RestApiId: !Ref Api
       ResourceId: !Ref ApiResource
@@ -793,6 +783,10 @@ Resources:
 
   StatusMethod:
     Type: AWS::ApiGateway::Method
+    DependsOn: 
+      - ApiGatewayRole
+      - StatusResource
+      - StoryProcessingStateMachine
     Properties:
       RestApiId: !Ref Api
       ResourceId: !Ref StatusResource
@@ -831,16 +825,22 @@ Resources:
           ResponseModels:
             application/json: "Empty"
 
+  # Create deployment after all methods are created
   ApiDeployment:
     Type: AWS::ApiGateway::Deployment
     DependsOn: 
       - ApiMethod
       - StatusMethod
+      - ApiResource
+      - StatusResource
     Properties:
       RestApiId: !Ref Api
+      Description: "Production deployment"
 
+  # Create stage after deployment
   ApiStage:
     Type: AWS::ApiGateway::Stage
+    DependsOn: ApiDeployment
     Properties:
       DeploymentId: !Ref ApiDeployment
       RestApiId: !Ref Api
