@@ -405,7 +405,7 @@ Resources:
                   - states:DescribeExecution
                 Resource: 
                   - !Ref StoryProcessingStateMachine
-                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}*
+                  - !Sub arn:aws:states:${AWS::Region}:${AWS::AccountId}:execution:${StoryProcessingStateMachine.Name}:*
 
   # API Gateway Resources
   Api:
