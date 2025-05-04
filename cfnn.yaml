@@ -177,7 +177,7 @@ Resources:
                 Resource: '*'
 
   # Lambda Functions
-  FirstLambda:
+FirstLambda:
     Type: AWS::Lambda::Function
     DependsOn:
       - VideoGeneratorRole
@@ -208,14 +208,10 @@ Resources:
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
-          # Get bucket name from environment variable
           BUCKET_NAME = os.environ['BUCKET_NAME']
-
-          # Define the target resolution
           TARGET_WIDTH = 1280
           TARGET_HEIGHT = 720
 
-          # Create the clients
           bedrock = boto3.client(
               service_name='bedrock-runtime',
               region_name="us-east-1",
@@ -233,6 +229,28 @@ Resources:
               topic_str = sanitize_topic(topic)
               unique_id = str(uuid.uuid4())[:6]
               return f"{date_str}_{topic_str}_{unique_id}"
+
+          def save_image_to_s3(image_base64, story_id, scene_number):
+              try:
+                  image_data = base64.b64decode(image_base64)
+                  key = f"{story_id}/scene_{scene_number}.png"
+                  current_time = datetime.now().isoformat()  
+                  s3.put_object(
+                      Bucket=BUCKET_NAME,
+                      Key=key,
+                      Body=image_data,
+                      ContentType='image/png',
+                      Metadata={
+                          'created-date': current_time,
+                          'last-modified-date': current_time
+                      }
+                  )
+                  
+                  url = f"s3://{BUCKET_NAME}/{key}"
+                  return url
+              except Exception as e:
+                  logger.error(f"Error saving image to S3: {str(e)}")
+                  return None
 
           def generate_story_description(full_text):
               try:
@@ -277,6 +295,7 @@ Resources:
               except Exception as e:
                   logger.error(f"Error generating story description: {str(e)}")
                   return "A story unfolds across five scenes."
+
           def generate_story_steps(user_input):
               try:
                   enhanced_prompt = f"""Create 5 sequential scenes telling a story about: {user_input}
@@ -498,30 +517,6 @@ Resources:
                       'timestamp': datetime.now().isoformat()
                   }
 
-          def extract_character_details(story_text):
-              characters = {}
-              name_pattern = r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)'
-              
-              scenes = story_text.split('Scene')
-              for scene in scenes:
-                  matches = re.finditer(name_pattern, scene)
-                  for match in matches:
-                      name = match.group(1)
-                      if name not in characters:
-                          sentence = next((s for s in scene.split('.') if name in s), '')
-                          characters[name] = {
-                              'first_appearance': sentence,
-                              'scenes_present': [scenes.index(scene) + 1]
-                          }
-                      else:
-                          characters[name]['scenes_present'].append(scenes.index(scene) + 1)
-              
-              return characters
-
-
-    
-
-          
   # Second Lambda Function
   SecondLambda:
     Type: AWS::Lambda::Function
