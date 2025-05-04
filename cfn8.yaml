@@ -550,13 +550,13 @@ Resources:
   SecondLambda:
     Type: AWS::Lambda::Function
     DependsOn:
-      - SecondLambdaRole
+      - VideoGeneratorRole
       - SourceBucket
       - DestinationBucket
     Properties:
       FunctionName: VideoGeneratorFunction
       Handler: index.handler
-      Role: !GetAtt SecondLambdaRole.Arn
+      Role: !GetAtt VideoGeneratorRole.Arn
       Runtime: python3.9
       Timeout: 900
       MemorySize: 1024
@@ -598,7 +598,7 @@ Resources:
                   if not story_id:
                       raise ValueError("story_id is required")
 
-                  print(f"Processing story_id: {story_id}")
+                  logger.info(f"Processing story_id: {story_id}")
 
                   scene_json_response = s3_client.get_object(
                       Bucket=INPUT_BUCKET,
@@ -633,8 +633,9 @@ Resources:
                       }
                   }
                   
-                  print("Request body:", json.dumps(request_body, indent=2))
+                  logger.info(f"Request body: {json.dumps(request_body, indent=2)}")
                   
+                  # Start async video generation with story_id in path
                   response = bedrock_client.start_async_invoke(
                       modelId='amazon.nova-reel-v1:1',
                       modelInput=request_body,
@@ -645,14 +646,14 @@ Resources:
                       }
                   )
                   invocation_arn = response["invocationArn"]
-                  status, output_location = monitor_video_generation(bedrock_client, invocation_arn)
+                  status, output_location = monitor_video_generation(bedrock_client, invocation_arn, story_id)
 
                   response = {
                       'status': status,
                       'story_id': story_id,
                       'source_bucket': INPUT_BUCKET,
                       'destination_bucket': OUTPUT_BUCKET,
-                      'output_location': output_location,
+                      'output_location': f"s3://{OUTPUT_BUCKET}/{story_id}/output.mp4",
                       'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
                   }
                   
@@ -676,9 +677,9 @@ Resources:
                       'timestamp': time.strftime('%Y-%m-%d %H:%M:%S')
                   }
 
-          def monitor_video_generation(bedrock_client, invocation_arn: str) -> Tuple[str, str]:
+          def monitor_video_generation(bedrock_client, invocation_arn: str, story_id: str) -> Tuple[str, str]:
               job_id = invocation_arn.split("/")[-1]
-              s3_location = f"s3://{OUTPUT_BUCKET}/{job_id}"
+              s3_location = f"s3://{OUTPUT_BUCKET}/{story_id}"
               start_time = time.time()
               
               logger.info(f"Monitoring job folder: {s3_location}")
@@ -703,7 +704,43 @@ Resources:
                       return "Error", s3_location
                       
               output_location = f"{s3_location}/output.mp4" if status == "Completed" else None
+              logger.info(f"Final output location: {output_location}")
               return status, output_location
+
+  VideoGeneratorRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: VideoGeneratorAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                Resource: 
+                  - !Sub ${SourceBucket.Arn}/*
+                  - !Sub ${SourceBucket.Arn}
+                  - !Sub ${DestinationBucket.Arn}/*
+                  - !Sub ${DestinationBucket.Arn}
+              - Effect: Allow
+                Action:
+                  - bedrock:InvokeModel
+                  - bedrock:StartAsyncInvoke
+                  - bedrock:GetAsyncInvoke
+                Resource: '*'
+
 
   # AudioVideoMerger Function
   AudioVideoMergerFunction:
