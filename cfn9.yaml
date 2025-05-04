@@ -176,28 +176,6 @@ Resources:
                   - bedrock:GetAsyncInvoke
                 Resource: '*'
 
-  PresignedUrlRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: S3PresignedUrlAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                Resource: 
-                  - !Sub ${DestinationBucket.Arn}/*
   # Lambda Functions
   FirstLambda:
     Type: AWS::Lambda::Function
@@ -1197,63 +1175,6 @@ Resources:
                       }
                   }
 
-
-
-  # PresignedUrl Lambda Function
-  PresignedUrlFunction:
-    Type: AWS::Lambda::Function
-    Properties:
-      FunctionName: GeneratePresignedUrlFunction
-      Handler: index.lambda_handler
-      Role: !GetAtt PresignedUrlRole.Arn
-      Runtime: python3.9
-      Timeout: 30
-      Code:
-        ZipFile: |
-          import boto3
-          import json
-          from urllib.parse import urlparse
-          import logging
-
-          logger = logging.getLogger()
-          logger.setLevel(logging.INFO)
-
-          def lambda_handler(event, context):
-              try:
-                  s3_path = event.get('s3_url', '')
-                  if not s3_path.startswith('s3://'):
-                      return {
-                          'statusCode': 400,
-                          'body': 'Invalid S3 URL format'
-                      }
-                  
-                  parsed = urlparse(s3_path)
-                  bucket = parsed.netloc
-                  key = parsed.path.lstrip('/')
-                  
-                  s3_client = boto3.client('s3')
-                  presigned_url = s3_client.generate_presigned_url(
-                      'get_object',
-                      Params={
-                          'Bucket': bucket,
-                          'Key': key
-                      },
-                      ExpiresIn=3600  # URL expires in 1 hour
-                  )
-                  
-                  return {
-                      'statusCode': 200,
-                      'presigned_url': presigned_url,
-                      'expires_in': 3600,
-                      'original_path': s3_path
-                  }
-              
-              except Exception as e:
-                  logger.error(f"Error generating presigned URL: {str(e)}")
-                  return {
-                      'statusCode': 500,
-                      'body': f'Error generating presigned URL: {str(e)}'
-                  }
 
   # Step Functions Definition
   StatesExecutionRole:
