@@ -215,12 +215,12 @@ Resources:
   FirstLambda:
     Type: AWS::Lambda::Function
     DependsOn:
-      - FirstLambdaRole
+      - VideoGeneratorRole
       - SourceBucket
     Properties:
-      FunctionName: StoryGeneratorFunction
+      FunctionName: VideoGeneratorFunction
       Handler: index.handler
-      Role: !GetAtt FirstLambdaRole.Arn
+      Role: !GetAtt VideoGeneratorRole.Arn
       Runtime: python3.9
       Timeout: 900
       MemorySize: 1024
@@ -238,58 +238,25 @@ Resources:
           import uuid
           import re
           import os
+          import logging
 
+          logger = logging.getLogger()
+          logger.setLevel(logging.INFO)
+
+          # Get bucket name from environment variable
           BUCKET_NAME = os.environ['BUCKET_NAME']
+
+          # Define the target resolution
           TARGET_WIDTH = 1280
           TARGET_HEIGHT = 720
 
+          # Create the clients
           bedrock = boto3.client(
               service_name='bedrock-runtime',
               region_name="us-east-1",
               config=Config(read_timeout=300)
           )
           s3 = boto3.client('s3')
-
-          def generate_polly_text(scene_data):
-              """
-              Generates a narrative summary from scene descriptions suitable for Polly
-              """
-              try:
-                  first_scene = scene_data.get('shot1_text', '')
-                  character_match = re.search(r'(\w+)\s*\((.*?)\)', first_scene)
-                  if not character_match:
-                      return "A story unfolds across five scenes."
-                      
-                  main_character = character_match.group(1)
-                  char_description = character_match.group(2)
-                  
-                  location_match = re.search(r'- ([^-]+) - [^-]+ light', first_scene)
-                  setting = location_match.group(1) if location_match else "the room"
-                  
-                  intro = f"Join {main_character}, {char_description}, as we follow their journey."
-                  
-                  narrative_points = []
-                  for i in range(1, 6):
-                      scene = scene_data.get(f'shot{i}_text', '')
-                      action_match = re.search(r'- ([^-]+) -[^-]+ -', scene)
-                      if action_match:
-                          action = action_match.group(1).strip()
-                          action = re.sub(r'\([^)]+\)', '', action).strip()
-                          narrative_points.append(action)
-                  
-                  narrative = f"{intro} In {setting}, "
-                  narrative += ", then ".join(narrative_points[:-1])
-                  narrative += f", and finally {narrative_points[-1]}."
-                  
-                  if len(narrative.split()) > 60:
-                      narrative = f"{intro} In {setting}, {narrative_points[0]}, "
-                      narrative += f"{narrative_points[2]}, and {narrative_points[-1]}."
-                      
-                  return narrative
-                  
-              except Exception as e:
-                  print(f"Error generating Polly text: {str(e)}")
-                  return "A story unfolds across five scenes."
 
           def sanitize_topic(topic):
               sanitized = topic.lower().replace(' ', '_')
@@ -302,6 +269,49 @@ Resources:
               unique_id = str(uuid.uuid4())[:6]
               return f"{date_str}_{topic_str}_{unique_id}"
 
+          def generate_story_description(full_text):
+              try:
+                  prompt = f"""Create a concise, engaging 30-second narration from this story. 
+                  Focus on the main character's journey and key moments.
+                  The narration should flow naturally and be suitable for voice-over.
+                  Keep it under 100 words while maintaining story impact.
+
+                  Story text:
+                  {full_text}
+
+                  Requirements:
+                  - Start with an engaging introduction of the main character
+                  - Highlight 2-3 key moments
+                  - End with the resolution
+                  - Use natural, conversational language
+                  - Maintain emotional connection
+                  - Keep it concise for 30-second narration
+
+                  Format: Single paragraph narrative suitable for voice-over."""
+
+                  conversation = [
+                      {
+                          "role": "user",
+                          "content": [{"text": prompt}],
+                      }
+                  ]
+
+                  response = bedrock.converse(
+                      modelId="anthropic.claude-3-sonnet-20240229-v1:0",
+                      messages=conversation,
+                      inferenceConfig={
+                          "maxTokens": 200,
+                          "temperature": 0.7,
+                          "topP": 0.9
+                      }
+                  )
+
+                  narrative = response["output"]["message"]["content"][0]["text"].strip()
+                  return narrative
+
+              except Exception as e:
+                  logger.error(f"Error generating story description: {str(e)}")
+                  return "A story unfolds across five scenes."
           def generate_story_steps(user_input):
               try:
                   enhanced_prompt = f"""Create 5 sequential scenes telling a story about: {user_input}
@@ -362,20 +372,19 @@ Resources:
                   }
                   
               except Exception as e:
-                  print(f"Error in generate_story_steps: {str(e)}")
+                  logger.error(f"Error in generate_story_steps: {str(e)}")
                   default_scenes = [f"Scene {i} about {user_input}" for i in range(1, 6)]
                   return {
                       'scenes': default_scenes,
                       'full_text': '\n'.join(default_scenes)
                   }
 
-          # Continue with remaining FirstLambda functions in PART 3...
           def image_from_text(text):
               body = json.dumps({
                   "taskType": "TEXT_IMAGE",
                   "textToImageParams": {
                       "text": text,
-                      "negativeText": "blurry, distorted, melting, overlapping elements, inconsistent appearances, changing features, morphing characters"
+                      "negativeText": "blurry, distorted, melting, overlapping elements, cartoon, anime, illustration, drawing, painted, artistic, sketchy, comic book style, cel shading, unrealistic, low quality, artificial, inconsistent appearances, changing features, morphing characters, animation style"
                   },
                   "imageGenerationConfig": {
                       "numberOfImages": 1,
@@ -385,7 +394,7 @@ Resources:
                       "seed": 0
                   }
               })
-              
+
               response = bedrock.invoke_model(
                   body=body,
                   modelId="amazon.nova-canvas-v1:0",
@@ -395,28 +404,6 @@ Resources:
               
               response_body = json.loads(response.get("body").read())
               return response_body.get("images")[0]
-
-          def save_image_to_s3(image_base64, story_id, scene_number):
-              try:
-                  image_data = base64.b64decode(image_base64)
-                  key = f"{story_id}/scene_{scene_number}.png"
-                  current_time = datetime.now().isoformat()  
-                  s3.put_object(
-                      Bucket=BUCKET_NAME,
-                      Key=key,
-                      Body=image_data,
-                      ContentType='image/png',
-                      Metadata={
-                          'created-date': current_time,
-                          'last-modified-date': current_time
-                      }
-                  )
-                  
-                  url = f"s3://{BUCKET_NAME}/{key}"
-                  return url
-              except Exception as e:
-                  print(f"Error saving image to S3: {str(e)}")
-                  return None
 
           def save_metadata_to_s3(story_id, metadata, scenes):
               try:
@@ -451,7 +438,7 @@ Resources:
                   
                   return True
               except Exception as e:
-                  print(f"Error saving metadata to S3: {str(e)}")
+                  logger.error(f"Error saving metadata to S3: {str(e)}")
                   return False
 
           def handler(event, context):
@@ -469,20 +456,15 @@ Resources:
                       raise ValueError("Topic is required")
                   
                   story_id = generate_story_id(user_input)
-                  print(f"Generating story for topic: {user_input}")
+                  logger.info(f"Generating story for topic: {user_input}")
                   
                   story_data = generate_story_steps(user_input)
                   scenes = story_data['scenes']
                   full_text = story_data['full_text']
                   
-                  # Generate Polly input text from scenes
-                  scene_data = {
-                      f"shot{i+1}_text": scenes[i-1]
-                      for i in range(1, 6)
-                  }
-                  polly_input = generate_polly_text(scene_data)
+                  polly_input = generate_story_description(full_text)
                   
-                  print("Generating images for scenes")
+                  logger.info("Generating images for scenes")
                   images = []
                   image_urls = []
                   
@@ -497,7 +479,8 @@ Resources:
                   save_metadata_to_s3(story_id, metadata, scenes)
                   
                   for idx, scene in enumerate(scenes):
-                      print(f"Generating image {idx + 1}/5")
+                      logger.info(f"Generating image {idx + 1}/5")
+                      
                       scene_number = idx + 1
                       scene_context = f"""Scene {scene_number} of 5:
                       {scene} """
@@ -520,11 +503,12 @@ Resources:
                               raise Exception(f"Failed to save image {scene_number} to S3")
                           
                       except Exception as img_error:
-                          print(f"Error generating image {scene_number}: {str(img_error)}")
+                          logger.error(f"Error generating image {scene_number}: {str(img_error)}")
                           continue
                   
                   metadata['generated_images'] = len(images)
                   metadata['image_urls'] = image_urls
+                  
                   save_metadata_to_s3(story_id, metadata, scenes)
                   
                   response_data = {
@@ -541,15 +525,38 @@ Resources:
 
               except Exception as e:
                   error_message = str(e)
-                  print(f"Error in handler: {error_message}")
+                  logger.error(f"Error in handler: {error_message}")
+                  
                   return {
                       'error': error_message,
                       'error_type': type(e).__name__,
                       'timestamp': datetime.now().isoformat()
                   }
 
-          def enhance_scene_description(scene_text):
-              return scene_text
+          def extract_character_details(story_text):
+              characters = {}
+              name_pattern = r'([A-Z][a-z]+(?:\s[A-Z][a-z]+)*)'
+              
+              scenes = story_text.split('Scene')
+              for scene in scenes:
+                  matches = re.finditer(name_pattern, scene)
+                  for match in matches:
+                      name = match.group(1)
+                      if name not in characters:
+                          sentence = next((s for s in scene.split('.') if name in s), '')
+                          characters[name] = {
+                              'first_appearance': sentence,
+                              'scenes_present': [scenes.index(scene) + 1]
+                          }
+                      else:
+                          characters[name]['scenes_present'].append(scenes.index(scene) + 1)
+              
+              return characters
+
+
+    
+
+          
   # Second Lambda Function
   SecondLambda:
     Type: AWS::Lambda::Function
