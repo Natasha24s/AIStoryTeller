@@ -773,7 +773,7 @@ Resources:
           SOURCE_BUCKET: !Ref SourceBucketName
           DESTINATION_BUCKET: !Ref DestinationBucketName
           MEDIACONVERT_ROLE_ARN: !GetAtt MediaConvertRole.Arn
-          MEDIACONVERT_ENDPOINT: !Ref MediaConvertEndpoint
+          
       Code:
         ZipFile: !Sub |
           import boto3
