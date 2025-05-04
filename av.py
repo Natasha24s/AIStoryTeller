@@ -18,6 +18,17 @@ def get_mediaconvert_endpoint():
         logger.error(f"Error getting MediaConvert endpoint: {str(e)}")
         raise
 
+def verify_file_exists(s3_client, bucket, key):
+    """
+    Verify that a file exists in S3
+    """
+    try:
+        s3_client.head_object(Bucket=bucket, Key=key)
+        return True
+    except Exception as e:
+        logger.error(f"File not found - Bucket: {bucket}, Key: {key}, Error: {str(e)}")
+        return False
+
 def get_job_settings():
     """Return MediaConvert job settings with audio mixing"""
     sts_client = boto3.client('sts')
@@ -95,9 +106,7 @@ def get_job_settings():
     }
 
 def get_polly_output_file(s3_client, bucket, prefix, task_id, max_attempts=60, delay=10):
-    """
-    Wait for and return the actual Polly output file path with increased timeout and better monitoring
-    """
+    """Wait for and return the actual Polly output file path"""
     logger.info(f"Waiting for Polly file in bucket: {bucket}, prefix: {prefix}, task_id: {task_id}")
     
     for attempt in range(max_attempts):
@@ -112,8 +121,6 @@ def get_polly_output_file(s3_client, bucket, prefix, task_id, max_attempts=60, d
             if task_state == 'completed':
                 # Get the output URL directly from the task status
                 output_uri = task_status['SynthesisTask']['OutputUri']
-                
-                # Extract the key from the output URI
                 output_key = output_uri.split(bucket + '/')[-1]
                 logger.info(f"Found Polly output file: {output_key}")
                 return output_key
@@ -136,6 +143,36 @@ def get_polly_output_file(s3_client, bucket, prefix, task_id, max_attempts=60, d
             continue
     
     raise Exception(f"Timeout waiting for Polly file after {max_attempts} attempts")
+
+def wait_for_mediaconvert_job(mediaconvert_client, job_id, max_attempts=30, delay=10):
+    """Wait for MediaConvert job to complete"""
+    logger.info(f"Waiting for MediaConvert job {job_id} to complete")
+    
+    for attempt in range(max_attempts):
+        try:
+            response = mediaconvert_client.get_job(Id=job_id)
+            status = response['Job']['Status']
+            
+            logger.info(f"MediaConvert job status (Attempt {attempt + 1}/{max_attempts}): {status}")
+            
+            if status == 'COMPLETE':
+                logger.info("MediaConvert job completed successfully")
+                return True, None
+            elif status in ['ERROR', 'CANCELED']:
+                error_message = response['Job'].get('ErrorMessage', 'Unknown error')
+                logger.error(f"MediaConvert job failed: {error_message}")
+                return False, error_message
+            
+            logger.info(f"Waiting {delay} seconds before next check...")
+            time.sleep(delay)
+            
+        except Exception as e:
+            logger.error(f"Error checking MediaConvert job: {str(e)}")
+            if attempt == max_attempts - 1:
+                return False, str(e)
+            time.sleep(delay)
+    
+    return False, "Timeout waiting for MediaConvert job"
 
 def lambda_handler(event, context):
     try:
@@ -164,10 +201,36 @@ def lambda_handler(event, context):
                 }
             }
         
-        # Parse video path
+        # Parse video path and handle Nova Reel's output path structure
         video_path = video_path.replace('s3://', '')
         video_bucket = video_path.split('/')[0]
-        video_key = '/'.join(video_path.split('/')[1:])
+        
+        # Check if the path contains story_id
+        path_parts = video_path.split('/')
+        if len(path_parts) > 3:  # If path includes story_id
+            video_key = '/'.join(path_parts[1:])  # Include story_id in the path
+        else:
+            video_key = '/'.join(path_parts[1:])
+
+        logger.info(f"Parsed video path - Bucket: {video_bucket}, Key: {video_key}")
+
+        # Verify video file exists
+        if not verify_file_exists(s3_client, video_bucket, video_key):
+            # Try alternative path with story_id
+            alternative_key = f"{story_id}/{video_key}"
+            logger.info(f"Trying alternative path: {alternative_key}")
+            
+            if verify_file_exists(s3_client, video_bucket, alternative_key):
+                video_key = alternative_key
+                logger.info(f"Found video at alternative path")
+            else:
+                return {
+                    'statusCode': 500,
+                    'body': {
+                        'message': f'Input video file not found at either path: \n1. s3://{video_bucket}/{video_key}\n2. s3://{video_bucket}/{alternative_key}',
+                        'story_id': story_id
+                    }
+                }
         
         source_bucket = os.environ['SOURCE_BUCKET']
         destination_bucket = os.environ['DESTINATION_BUCKET']
@@ -178,7 +241,6 @@ def lambda_handler(event, context):
             timestamp = int(time.time())
             audio_prefix = f"{story_id}/audio/speech_{timestamp}"
             
-            # Start Polly synthesis with enhanced settings
             polly_response = polly_client.start_speech_synthesis_task(
                 Engine='neural',
                 LanguageCode='en-US',
@@ -187,20 +249,19 @@ def lambda_handler(event, context):
                 OutputS3KeyPrefix=audio_prefix,
                 Text=polly_input,
                 VoiceId='Ruth',
-                SampleRate='24000',  # Match with video frame rate
+                SampleRate='24000',
                 TextType='text'
             )
             
             task_id = polly_response['SynthesisTask']['TaskId']
             logger.info(f"Polly task started with ID: {task_id}")
             
-            # Wait for Polly file with increased timeout
             actual_audio_key = get_polly_output_file(
                 s3_client, 
                 destination_bucket, 
                 f"{story_id}/audio/",
                 task_id,
-                max_attempts=60,  # Increased to 10 minutes total wait time
+                max_attempts=60,
                 delay=10
             )
             
@@ -216,27 +277,19 @@ def lambda_handler(event, context):
             
             logger.info(f"Found Polly output file: {actual_audio_key}")
             
-            # Verify the audio file exists
-            try:
-                s3_client.head_object(
-                    Bucket=destination_bucket,
-                    Key=actual_audio_key
-                )
-            except Exception as e:
-                logger.error(f"Audio file not found in S3: {str(e)}")
-                return {
-                    'statusCode': 500,
-                    'body': {
-                        'message': 'Audio file not found in S3 after successful Polly task',
-                        'story_id': story_id,
-                        'polly_task_id': task_id
-                    }
-                }
-
             try:
                 job_settings = get_job_settings()
                 
-                # Set input settings with modified audio selectors
+                input_config = {
+                    'FileInput': f"s3://{video_bucket}/{video_key}",
+                    'AudioSelectors': {
+                        'Audio Selector 2': {
+                            'ExternalAudioFileInput': f"s3://{destination_bucket}/{actual_audio_key}"
+                        }
+                    }
+                }
+                logger.info(f"MediaConvert input configuration: {json.dumps(input_config)}")
+                
                 job_settings['Settings']['Inputs'] = [{
                     'AudioSelectors': {
                         'Audio Selector 1': {
@@ -265,29 +318,60 @@ def lambda_handler(event, context):
                 }]
                 
                 # Set output location
+                output_key = f"{story_id}/final/final_output.mp4"
                 job_settings['Settings']['OutputGroups'][0]['OutputGroupSettings']['FileGroupSettings']['Destination'] = \
-                    f"s3://{destination_bucket}/{story_id}/final/final_output.mp4"
+                    f"s3://{destination_bucket}/{output_key}"
                 
                 logger.info(f"Creating MediaConvert job for story_id: {story_id}")
                 logger.info(f"Using video input: s3://{video_bucket}/{video_key}")
                 
                 mediaconvert_response = mediaconvert_client.create_job(**job_settings)
+                job_id = mediaconvert_response['Job']['Id']
+
+                # Wait for MediaConvert job to complete
+                success, error = wait_for_mediaconvert_job(
+                    mediaconvert_client,
+                    job_id,
+                    max_attempts=30,
+                    delay=10
+                )
+
+                if not success:
+                    return {
+                        'statusCode': 500,
+                        'body': {
+                            'message': f"MediaConvert job failed: {error}",
+                            'story_id': story_id,
+                            'job_id': job_id
+                        }
+                    }
+
+                # Verify the output file exists
+                if not verify_file_exists(s3_client, destination_bucket, output_key):
+                    return {
+                        'statusCode': 500,
+                        'body': {
+                            'message': 'MediaConvert output file not found',
+                            'story_id': story_id,
+                            'job_id': job_id
+                        }
+                    }
                 
                 return {
                     'statusCode': 200,
                     'body': {
-                        'message': 'Processing jobs started successfully',
-                        'mediaconvert_job_id': mediaconvert_response['Job']['Id'],
+                        'message': 'Processing completed successfully',
+                        'mediaconvert_job_id': job_id,
                         'polly_task_id': task_id,
                         'story_id': story_id,
                         'input_paths': {
                             'video': f"s3://{video_bucket}/{video_key}",
                             'audio': f"s3://{destination_bucket}/{actual_audio_key}"
                         },
-                        'output_path': f"s3://{destination_bucket}/{story_id}/final/final_output.mp4",
+                        'output_path': f"s3://{destination_bucket}/{output_key}",
                         'status': {
                             'polly': 'COMPLETED',
-                            'mediaconvert': 'SUBMITTED'
+                            'mediaconvert': 'COMPLETED'
                         }
                     }
                 }
