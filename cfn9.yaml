@@ -1199,7 +1199,7 @@ Resources:
                   - !GetAtt FirstLambda.Arn
                   - !GetAtt SecondLambda.Arn
                   - !GetAtt AudioVideoMergerFunction.Arn
-                  - !GetAtt PresignedUrlFunction.Arn
+                  
 
   StoryProcessingStateMachine:
     Type: AWS::StepFunctions::StateMachine
