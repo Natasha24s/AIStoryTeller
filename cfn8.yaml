@@ -25,6 +25,7 @@ Resources:
       BucketName: !Ref DestinationBucketName
 
   # MediaConvert Role
+  # MediaConvert Role
   MediaConvertRole:
     Type: AWS::IAM::Role
     Properties:
@@ -72,6 +73,53 @@ Resources:
                   - logs:CreateLogStream
                   - logs:PutLogEvents
                 Resource: "*"
+
+  # Audio Merger Lambda Role
+  AudioMergerLambdaRole:
+    Type: AWS::IAM::Role
+    DependsOn: MediaConvertRole
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal:
+              Service: lambda.amazonaws.com
+            Action: sts:AssumeRole
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+      Policies:
+        - PolicyName: S3AndMediaConvertAccess
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Effect: Allow
+                Action:
+                  - s3:GetObject
+                  - s3:PutObject
+                  - s3:ListBucket
+                  - s3:HeadObject
+                Resource: 
+                  - !Sub ${SourceBucket.Arn}/*
+                  - !Sub ${DestinationBucket.Arn}/*
+                  - !Sub ${SourceBucket.Arn}
+                  - !Sub ${DestinationBucket.Arn}
+              - Effect: Allow
+                Action:
+                  - polly:StartSpeechSynthesisTask
+                  - polly:GetSpeechSynthesisTask
+                  - polly:ListSpeechSynthesisTasks
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - mediaconvert:CreateJob
+                  - mediaconvert:DescribeEndpoints
+                  - mediaconvert:GetJob
+                Resource: '*'
+              - Effect: Allow
+                Action:
+                  - iam:PassRole
+                Resource: !GetAtt MediaConvertRole.Arn
 
 
   # Lambda Roles
@@ -139,38 +187,6 @@ Resources:
                   - bedrock:InvokeModel
                   - bedrock:StartAsyncInvoke
                   - bedrock:GetAsyncInvoke
-                Resource: '*'
-
-  AudioMergerLambdaRole:
-    Type: AWS::IAM::Role
-    Properties:
-      AssumeRolePolicyDocument:
-        Version: '2012-10-17'
-        Statement:
-          - Effect: Allow
-            Principal:
-              Service: lambda.amazonaws.com
-            Action: sts:AssumeRole
-      ManagedPolicyArns:
-        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
-      Policies:
-        - PolicyName: S3AndMediaConvertAccess
-          PolicyDocument:
-            Version: '2012-10-17'
-            Statement:
-              - Effect: Allow
-                Action:
-                  - s3:GetObject
-                  - s3:PutObject
-                  - s3:ListBucket
-                Resource: 
-                  - !Sub ${SourceBucket.Arn}/*
-                  - !Sub ${DestinationBucket.Arn}/*
-              - Effect: Allow
-                Action:
-                  - polly:StartSpeechSynthesisTask
-                  - mediaconvert:CreateJob
-                  - mediaconvert:DescribeEndpoints
                 Resource: '*'
 
   PresignedUrlRole:
@@ -724,14 +740,24 @@ Resources:
           logger = logging.getLogger()
           logger.setLevel(logging.INFO)
 
+          def get_mediaconvert_endpoint():
+              """Get MediaConvert endpoint for the current region"""
+              try:
+                  mediaconvert_client = boto3.client('mediaconvert')
+                  response = mediaconvert_client.describe_endpoints()
+                  return response['Endpoints'][0]['Url']
+              except Exception as e:
+                  logger.error(f"Error getting MediaConvert endpoint: {str(e)}")
+                  raise
+
           def get_job_settings():
               """Return MediaConvert job settings with audio mixing"""
-              # Get current account ID
               sts_client = boto3.client('sts')
               account_id = sts_client.get_caller_identity()['Account']
+              region = os.environ.get('AWS_REGION', 'us-east-1')
               
               return {
-                  "Queue": f"arn:aws:mediaconvert:{os.environ.get('AWS_REGION', 'us-east-1')}:{account_id}:queues/Default",
+                  "Queue": f"arn:aws:mediaconvert:{region}:{account_id}:queues/Default",
                   "UserMetadata": {},
                   "Role": os.environ['MEDIACONVERT_ROLE_ARN'],
                   "Settings": {
@@ -800,40 +826,67 @@ Resources:
                   "Priority": 0
               }
 
-          def get_polly_output_file(s3_client, bucket, prefix, max_attempts=12, delay=5):
-              """Wait for and return the actual Polly output file path"""
-              for _ in range(max_attempts):
-                  try:
-                      response = s3_client.list_objects_v2(
-                          Bucket=bucket,
-                          Prefix=prefix
-                      )
-                      
-                      if 'Contents' in response:
-                          files = sorted(response['Contents'], key=lambda x: x['LastModified'], reverse=True)
-                          if files:
-                              return files[0]['Key']
-                  except Exception as e:
-                      logger.error(f"Error checking S3: {str(e)}")
-                  
-                  time.sleep(delay)
+          def get_polly_output_file(s3_client, bucket, prefix, task_id, max_attempts=60, delay=10):
+              """
+              Wait for and return the actual Polly output file path with increased timeout and better monitoring
+              """
+              logger.info(f"Waiting for Polly file in bucket: {bucket}, prefix: {prefix}, task_id: {task_id}")
               
-              return None
+              for attempt in range(max_attempts):
+                  try:
+                      # Check Polly task status
+                      polly_client = boto3.client('polly')
+                      task_status = polly_client.get_speech_synthesis_task(TaskId=task_id)
+                      task_state = task_status['SynthesisTask']['TaskStatus']
+                      
+                      logger.info(f"Polly task status (Attempt {attempt + 1}/{max_attempts}): {task_state}")
+                      
+                      if task_state == 'completed':
+                          # Get the output URL directly from the task status
+                          output_uri = task_status['SynthesisTask']['OutputUri']
+                          
+                          # Extract the key from the output URI
+                          output_key = output_uri.split(bucket + '/')[-1]
+                          logger.info(f"Found Polly output file: {output_key}")
+                          return output_key
+                          
+                      elif task_state == 'failed':
+                          error_message = task_status['SynthesisTask'].get('TaskStatusReason', 'Unknown error')
+                          logger.error(f"Polly task failed: {error_message}")
+                          raise Exception(f"Polly task failed: {error_message}")
+                      
+                      elif task_state == 'scheduled' or task_state == 'inProgress':
+                          logger.info(f"Polly task still processing. Waiting {delay} seconds...")
+                          time.sleep(delay)
+                          continue
+                      
+                  except Exception as e:
+                      logger.error(f"Error checking Polly file (Attempt {attempt + 1}): {str(e)}")
+                      if attempt == max_attempts - 1:
+                          raise
+                      time.sleep(delay)
+                      continue
+              
+              raise Exception(f"Timeout waiting for Polly file after {max_attempts} attempts")
 
           def lambda_handler(event, context):
               try:
                   # Initialize AWS clients
                   s3_client = boto3.client('s3')
                   polly_client = boto3.client('polly')
-                  mediaconvert_client = boto3.client('mediaconvert', 
-                      endpoint_url=os.environ['MEDIACONVERT_ENDPOINT'])
+                  
+                  # Get MediaConvert endpoint
+                  endpoint_url = os.environ.get('MEDIACONVERT_ENDPOINT')
+                  if not endpoint_url:
+                      endpoint_url = get_mediaconvert_endpoint()
+                  
+                  mediaconvert_client = boto3.client('mediaconvert', endpoint_url=endpoint_url)
                   
                   # Get input parameters
                   story_id = event.get('story_id')
                   polly_input = event.get('polly_input')
                   video_path = event.get('video_path')
                   
-                  # Validate inputs
                   if not story_id or not polly_input or not video_path:
                       return {
                           'statusCode': 400,
@@ -851,33 +904,36 @@ Resources:
                   source_bucket = os.environ['SOURCE_BUCKET']
                   destination_bucket = os.environ['DESTINATION_BUCKET']
                   
-                  # Generate audio using Polly
                   try:
                       logger.info(f"Starting Polly synthesis for story_id: {story_id}")
                       
-                      # Create audio prefix
                       timestamp = int(time.time())
                       audio_prefix = f"{story_id}/audio/speech_{timestamp}"
                       
-                      # Start Polly synthesis task
+                      # Start Polly synthesis with enhanced settings
                       polly_response = polly_client.start_speech_synthesis_task(
                           Engine='neural',
-                          LanguageCode='en-IN',
+                          LanguageCode='en-US',
                           OutputFormat='mp3',
                           OutputS3BucketName=destination_bucket,
                           OutputS3KeyPrefix=audio_prefix,
                           Text=polly_input,
-                          VoiceId='Kajal'
+                          VoiceId='Ruth',
+                          SampleRate='24000',
+                          TextType='text'
                       )
                       
                       task_id = polly_response['SynthesisTask']['TaskId']
                       logger.info(f"Polly task started with ID: {task_id}")
                       
-                      # Wait for and get the actual audio file path
+                      # Wait for Polly file with increased timeout
                       actual_audio_key = get_polly_output_file(
                           s3_client, 
                           destination_bucket, 
-                          f"{story_id}/audio/"
+                          f"{story_id}/audio/",
+                          task_id,
+                          max_attempts=60,
+                          delay=10
                       )
                       
                       if not actual_audio_key:
@@ -892,12 +948,26 @@ Resources:
                       
                       logger.info(f"Found Polly output file: {actual_audio_key}")
                       
-                      # Create MediaConvert job
+                      # Verify the audio file exists
                       try:
-                          # Get job settings template
+                          s3_client.head_object(
+                              Bucket=destination_bucket,
+                              Key=actual_audio_key
+                          )
+                      except Exception as e:
+                          logger.error(f"Audio file not found in S3: {str(e)}")
+                          return {
+                              'statusCode': 500,
+                              'body': {
+                                  'message': 'Audio file not found in S3 after successful Polly task',
+                                  'story_id': story_id,
+                                  'polly_task_id': task_id
+                              }
+                          }
+
+                      try:
                           job_settings = get_job_settings()
                           
-                          # Set input settings with modified audio selectors
                           job_settings['Settings']['Inputs'] = [{
                               'AudioSelectors': {
                                   'Audio Selector 1': {
@@ -925,7 +995,6 @@ Resources:
                               'FileInput': f"s3://{video_bucket}/{video_key}"
                           }]
                           
-                          # Set output location
                           job_settings['Settings']['OutputGroups'][0]['OutputGroupSettings']['FileGroupSettings']['Destination'] = \
                               f"s3://{destination_bucket}/{story_id}/final/final_output.mp4"
                           
