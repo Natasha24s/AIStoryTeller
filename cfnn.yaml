@@ -183,7 +183,7 @@ Resources:
       - VideoGeneratorRole
       - SourceBucket
     Properties:
-      FunctionName: VideoGeneratorFunction
+      FunctionName: StoryGeneratorFunction
       Handler: index.handler
       Role: !GetAtt VideoGeneratorRole.Arn
       Runtime: python3.9
