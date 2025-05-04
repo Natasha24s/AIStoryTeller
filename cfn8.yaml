@@ -48,10 +48,12 @@ Resources:
                   - s3:ListBucket
                   - s3:HeadObject
                 Resource:
-                  - !Sub arn:aws:s3:::${SourceBucketName}/*
                   - !Sub arn:aws:s3:::${SourceBucketName}
-                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
+                  - !Sub arn:aws:s3:::${SourceBucketName}/*
+                  - !Sub arn:aws:s3:::${SourceBucketName}/*/*
                   - !Sub arn:aws:s3:::${DestinationBucketName}
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*/*
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
