@@ -24,7 +24,7 @@ Resources:
     Properties:
       BucketName: !Ref DestinationBucketName
 
-  # MediaConvert Role
+
   # MediaConvert Role
   MediaConvertRole:
     Type: AWS::IAM::Role
@@ -45,34 +45,21 @@ Resources:
                 Action:
                   - s3:GetObject
                   - s3:PutObject
+                  - s3:ListBucket
+                  - s3:HeadObject
                 Resource:
                   - !Sub arn:aws:s3:::${SourceBucketName}/*
-                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
-              - Effect: Allow
-                Action:
-                  - s3:ListBucket
-                Resource:
                   - !Sub arn:aws:s3:::${SourceBucketName}
+                  - !Sub arn:aws:s3:::${DestinationBucketName}/*
                   - !Sub arn:aws:s3:::${DestinationBucketName}
-              - Effect: Allow
-                Action:
-                  - execute-api:Invoke
-                  - execute-api:ManageConnections
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - sns:Publish
-                Resource: "*"
-              - Effect: Allow
-                Action:
-                  - cloudwatch:PutMetricData
-                Resource: "*"
               - Effect: Allow
                 Action:
                   - logs:CreateLogGroup
                   - logs:CreateLogStream
                   - logs:PutLogEvents
+                  - cloudwatch:PutMetricData
                 Resource: "*"
+
 
   # Audio Merger Lambda Role
   AudioMergerLambdaRole:
