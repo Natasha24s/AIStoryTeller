@@ -8,9 +8,7 @@ Parameters:
   DestinationBucketName:
     Type: String
     Description: Name of the destination S3 bucket for videos
-  MediaConvertEndpoint:
-    Type: String
-    Description: MediaConvert endpoint URL for your region
+
 
 Resources:
   # S3 Buckets
