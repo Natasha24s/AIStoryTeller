@@ -87,5 +87,57 @@ Or if completed:
   "message": "Video generation completed successfully"
 }
 ```
+The process flow is:
+
+```    
+GenerateStory (First Lambda)
+    ↓
+    - Generates scenes
+    - Creates polly_input narrative
+    ↓
+GenerateVideo (Second Lambda)
+    ↓
+    - Creates silent video using Nova Reel
+    - Saves to video_output_location
+    ↓
+GenerateAudioVideo (Third Lambda)
+    ↓
+    - Generates narration audio using Polly
+    - Uses MediaConvert to merge:
+      * Input video from video_output_location
+      * Narration audio from Polly
+    - Saves final merged video to final_output_location
+
+ ```   
+
+    
+Final output sample:
+
+  ```  
+{
+  "story_id": "20250501_a_day_at_the_beach_abc123",
+  "video_status": "Completed",
+  "video_output_location": "s3://your-destination-bucket/job-id/output.mp4",  // Silent video
+  "audio_video_status": "Completed",
+  "final_output_location": "s3://your-destination-bucket/20250501_a_day_at_the_beach_abc123/final/final_output.mp4",  // Video with narration
+  "timestamp": "2025-05-01 15:53:38",
+  "message": "Processing completed successfully",
+  "outputs": {
+    "initial_video": {
+      "status": "Completed",
+      "location": "s3://your-destination-bucket/job-id/output.mp4",  // Silent video
+      "timestamp": "2025-05-01 15:53:38"
+    },
+    "final_video": {
+      "status": "Completed",
+      "location": "s3://your-destination-bucket/20250501_a_day_at_the_beach_abc123/final/final_output.mp4",  // Video with narration
+      "timestamp": "2025-05-01 16:00:00"
+    }
+  }
+}
+```
+    
+
+    
 
     
